@@ -1,3 +1,6 @@
+print("handler.py loaded v0.2")
+
+
 import base64
 import io
 import time
