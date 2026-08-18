@@ -1,50 +1,25 @@
 import os
+import re
+import shutil
 
 # ============================================================
-# HUGGING FACE CACHE CONFIGURATION
+# HUGGING FACE / RUNPOD CACHE CONFIGURATION
 # ============================================================
 #
-# If a RunPod network volume is mounted at /runpod-volume,
-# Hugging Face models will be cached there.
-#
-# This is important because the Bayan model is approximately
-# 7.57 GB. We do NOT want to download it on every worker start.
-#
-# If /runpod-volume does not exist, we fall back to /tmp.
+# IMPORTANT:
+# The RunPod network volume is mounted at /runpod-volume.
+# Keep the Hugging Face cache there so the 7.57 GB Bayan model
+# does not consume the container's small local disk.
 #
 
-RUNPOD_VOLUME = "/runpod-volume"
+VOLUME_PATH = "/runpod-volume"
+HF_CACHE_DIR = os.path.join(VOLUME_PATH, "huggingface")
+HF_HOME = os.path.join(HF_CACHE_DIR, "hub")
 
-if os.path.isdir(RUNPOD_VOLUME):
-    HF_CACHE_DIR = os.path.join(
-        RUNPOD_VOLUME,
-        "huggingface"
-    )
-else:
-    HF_CACHE_DIR = "/tmp/huggingface"
-
-os.makedirs(HF_CACHE_DIR, exist_ok=True)
-
-# Tell Hugging Face libraries where to keep their cache.
-os.environ["HF_HOME"] = HF_CACHE_DIR
-os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(
-    HF_CACHE_DIR,
-    "hub"
-)
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(
-    HF_CACHE_DIR,
-    "transformers"
-)
-
-print("=" * 60)
-print("Hugging Face cache configuration")
-print(f"HF cache: {HF_CACHE_DIR}")
-print("=" * 60)
-
-
-# ============================================================
-# IMPORTS
-# ============================================================
+# Set these BEFORE importing transformers / huggingface_hub / SNAC.
+os.environ.setdefault("HF_HOME", HF_CACHE_DIR)
+os.environ.setdefault("HF_HUB_CACHE", HF_HOME)
+os.environ.setdefault("TRANSFORMERS_CACHE", HF_HOME)
 
 import numpy as np
 import torch
@@ -64,7 +39,6 @@ SNAC_MODEL_ID = "hubertsiuzdak/snac_24khz"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-
 # ============================================================
 # ORPHEUS SPECIAL TOKENS
 # ============================================================
@@ -75,7 +49,6 @@ EOH_TOKEN = 128260
 SOS_TOKEN = 128257
 EOS_TOKEN = 128258
 OFFSET = 128266
-
 
 # ============================================================
 # GENERATION DEFAULTS
@@ -88,18 +61,36 @@ DEFAULT_MAX_NEW_TOKENS = 500
 
 
 # ============================================================
+# CACHE / DISK HELPERS
+# ============================================================
+
+def print_disk_status():
+    """Print free/used space for the RunPod network volume."""
+    try:
+        total, used, free = shutil.disk_usage(VOLUME_PATH)
+
+        print(
+            "RunPod volume:"
+            f" {VOLUME_PATH} | "
+            f"Free: {free / (1024**3):.2f} GB | "
+            f"Used: {used / (1024**3):.2f} GB | "
+            f"Total: {total / (1024**3):.2f} GB"
+        )
+    except Exception as exc:
+        print(f"Could not read volume disk status: {exc}")
+
+
+# ============================================================
 # TTS GENERATOR
 # ============================================================
 
 class BayanTTS:
-
     def __init__(self):
-
         print("=" * 60)
         print("Initializing Bayan TTS")
         print(f"Model: {MODEL_ID}")
         print(f"Device: {DEVICE}")
-        print(f"HF cache: {HF_CACHE_DIR}")
+        print(f"HF cache: {HF_HOME}")
         print("=" * 60)
 
         if DEVICE != "cuda":
@@ -107,6 +98,16 @@ class BayanTTS:
                 "CUDA is not available. "
                 "This worker requires an NVIDIA GPU."
             )
+
+        if not os.path.isdir(VOLUME_PATH):
+            raise RuntimeError(
+                f"RunPod network volume was not found at {VOLUME_PATH}. "
+                "Make sure the 20 GB network volume is mounted there."
+            )
+
+        os.makedirs(HF_HOME, exist_ok=True)
+
+        print_disk_status()
 
         # ----------------------------------------------------
         # Hugging Face authentication
@@ -129,36 +130,36 @@ class BayanTTS:
 
         print("Loading SNAC...")
 
-        snac_path = self._get_cached_model(
-            repo_id=SNAC_MODEL_ID,
-            token=None,
-            name="SNAC"
-        )
-
         self.snac_model = (
-            SNAC.from_pretrained(snac_path)
+            SNAC.from_pretrained(
+                SNAC_MODEL_ID,
+                cache_dir=HF_HOME,
+            )
             .to(DEVICE)
             .eval()
         )
 
-        print("SNAC loaded successfully.")
+        print("SNAC loaded.")
 
         # ----------------------------------------------------
-        # Load Bayan model
+        # Download / locate Bayan model on the NETWORK VOLUME
         # ----------------------------------------------------
 
-        print("Preparing Bayan model cache...")
+        print("Checking Bayan model cache...")
+        print(f"Repository: {MODEL_ID}")
+        print(f"Cache directory: {HF_HOME}")
 
         bayan_path = self._get_cached_model(
-            repo_id=MODEL_ID,
-            token=hf_token,
-            name="Bayan"
+            MODEL_ID,
+            hf_token,
         )
 
-        print(f"Bayan model path: {bayan_path}")
+        print(f"Bayan model snapshot: {bayan_path}")
+
+        print_disk_status()
 
         # ----------------------------------------------------
-        # Load tokenizer
+        # Load tokenizer from the cached snapshot
         # ----------------------------------------------------
 
         print("Loading tokenizer...")
@@ -168,10 +169,10 @@ class BayanTTS:
             local_files_only=True,
         )
 
-        print("Tokenizer loaded successfully.")
+        print("Tokenizer loaded.")
 
         # ----------------------------------------------------
-        # Load fine-tuned model
+        # Load fine-tuned model from the cached snapshot
         # ----------------------------------------------------
 
         print("Loading Bayan model into GPU...")
@@ -189,64 +190,38 @@ class BayanTTS:
         print("Bayan model loaded successfully.")
         print("=" * 60)
 
-
     # ========================================================
     # HUGGING FACE MODEL CACHE
     # ========================================================
 
-    def _get_cached_model(
-        self,
-        repo_id,
-        token=None,
-        name="model",
-    ):
+    def _get_cached_model(self, model_id, hf_token):
         """
-        Download a Hugging Face repository once and reuse the
-        cached snapshot on subsequent worker starts.
+        Download the model into the RunPod network volume if it
+        is not already there.
 
-        If /runpod-volume exists, the cache survives worker
-        replacement/restarts provided the RunPod network volume
-        remains attached to the endpoint.
-
-        snapshot_download() automatically reuses an existing
-        cached snapshot instead of downloading everything again.
+        snapshot_download uses the Hugging Face cache and resumes
+        incomplete downloads. Therefore a failed download should
+        not require starting the 7.57 GB model from zero.
         """
 
-        print("-" * 60)
-        print(f"Checking {name} cache")
-        print(f"Repository: {repo_id}")
-        print(f"Cache directory: {HF_CACHE_DIR}")
+        print("Starting / resuming Hugging Face model download...")
+        print("This may take several minutes on a cold worker.")
 
-        try:
+        snapshot_path = snapshot_download(
+            repo_id=model_id,
+            cache_dir=HF_HOME,
+            token=hf_token,
+        )
 
-            snapshot_path = snapshot_download(
-                repo_id=repo_id,
-                token=token,
-                cache_dir=HF_CACHE_DIR,
-            )
+        print("Hugging Face model snapshot is ready.")
 
-            print(f"{name} snapshot ready.")
-            print(f"Local path: {snapshot_path}")
-
-            return snapshot_path
-
-        except Exception as e:
-
-            print("=" * 60)
-            print(f"ERROR while downloading/caching {name}")
-            print(f"Repository: {repo_id}")
-            print(f"Error: {e}")
-            print("=" * 60)
-
-            raise
-
+        return snapshot_path
 
     # ========================================================
     # SNAC AUDIO DECODING
     # ========================================================
 
     def decode_audio(self, code_list):
-
         """
         Convert Orpheus interleaved audio tokens into
         SNAC codes and decode to 24 kHz audio.
@@ -332,11 +307,9 @@ class BayanTTS:
         ]
 
         with torch.no_grad():
-
             audio = self.snac_model.decode(codes)
 
         return audio.cpu().numpy().squeeze()
-
 
     # ========================================================
     # SENTENCE GENERATION
@@ -354,9 +327,7 @@ class BayanTTS:
         text = text.strip()
 
         if not text:
-            raise ValueError(
-                "Text cannot be empty."
-            )
+            raise ValueError("Text cannot be empty.")
 
         # ----------------------------------------------------
         # Tokenize text
@@ -417,7 +388,6 @@ class BayanTTS:
         ).nonzero(as_tuple=True)
 
         if len(token_indices[1]) == 0:
-
             raise RuntimeError(
                 "SOS token was not found in model output."
             )
@@ -450,7 +420,6 @@ class BayanTTS:
         ]
 
         if not speech_tokens:
-
             raise RuntimeError(
                 "No speech tokens were generated."
             )
@@ -474,7 +443,6 @@ class BayanTTS:
 
         return audio
 
-
     # ========================================================
     # LONG-FORM GENERATION
     # ========================================================
@@ -488,8 +456,6 @@ class BayanTTS:
         max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
     ):
 
-        import re
-
         clean_text = re.sub(
             r"\s+",
             " ",
@@ -497,7 +463,6 @@ class BayanTTS:
         ).strip()
 
         if not clean_text:
-
             raise ValueError(
                 "Text cannot be empty."
             )
@@ -548,7 +513,6 @@ class BayanTTS:
             )
 
         if not combined_audio:
-
             raise RuntimeError(
                 "No audio was generated."
             )
@@ -572,29 +536,13 @@ def get_generator():
     global generator
 
     if generator is None:
-
-        print("=" * 60)
-        print("Creating BayanTTS generator for this worker.")
-        print("This should happen only once per worker.")
-        print("=" * 60)
-
         generator = BayanTTS()
-
-        print("=" * 60)
-        print("BayanTTS generator is now cached in memory.")
-        print("=" * 60)
-
-    else:
-
-        print(
-            "Reusing cached BayanTTS generator."
-        )
 
     return generator
 
 
 # ============================================================
-# LOCAL TEST
+# TEST
 # ============================================================
 
 if __name__ == "__main__":
