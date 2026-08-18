@@ -56,6 +56,21 @@ class BayanTTS:
             )
 
         # ----------------------------------------------------
+        # Hugging Face authentication
+        # ----------------------------------------------------
+
+        hf_token = os.environ.get("HF_TOKEN")
+
+        if not hf_token:
+            raise RuntimeError(
+                "HF_TOKEN environment variable is not set. "
+                "Please add your Hugging Face Read token "
+                "to the RunPod endpoint environment variables."
+            )
+
+        print("Hugging Face authentication token detected.")
+
+        # ----------------------------------------------------
         # Load SNAC
         # ----------------------------------------------------
 
@@ -74,7 +89,8 @@ class BayanTTS:
         print("Loading tokenizer...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_ID
+            MODEL_ID,
+            token=hf_token,
         )
 
         # ----------------------------------------------------
@@ -87,6 +103,7 @@ class BayanTTS:
             AutoModelForCausalLM.from_pretrained(
                 MODEL_ID,
                 torch_dtype=torch.bfloat16,
+                token=hf_token,
             )
             .to(DEVICE)
             .eval()
