@@ -1,8 +1,56 @@
 import os
+
+# ============================================================
+# HUGGING FACE CACHE CONFIGURATION
+# ============================================================
+#
+# If a RunPod network volume is mounted at /runpod-volume,
+# Hugging Face models will be cached there.
+#
+# This is important because the Bayan model is approximately
+# 7.57 GB. We do NOT want to download it on every worker start.
+#
+# If /runpod-volume does not exist, we fall back to /tmp.
+#
+
+RUNPOD_VOLUME = "/runpod-volume"
+
+if os.path.isdir(RUNPOD_VOLUME):
+    HF_CACHE_DIR = os.path.join(
+        RUNPOD_VOLUME,
+        "huggingface"
+    )
+else:
+    HF_CACHE_DIR = "/tmp/huggingface"
+
+os.makedirs(HF_CACHE_DIR, exist_ok=True)
+
+# Tell Hugging Face libraries where to keep their cache.
+os.environ["HF_HOME"] = HF_CACHE_DIR
+os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(
+    HF_CACHE_DIR,
+    "hub"
+)
+os.environ["TRANSFORMERS_CACHE"] = os.path.join(
+    HF_CACHE_DIR,
+    "transformers"
+)
+
+print("=" * 60)
+print("Hugging Face cache configuration")
+print(f"HF cache: {HF_CACHE_DIR}")
+print("=" * 60)
+
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
 import numpy as np
 import torch
 import soundfile as sf
 
+from huggingface_hub import snapshot_download
 from snac import SNAC
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -16,6 +64,7 @@ SNAC_MODEL_ID = "hubertsiuzdak/snac_24khz"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+
 # ============================================================
 # ORPHEUS SPECIAL TOKENS
 # ============================================================
@@ -27,6 +76,7 @@ SOS_TOKEN = 128257
 EOS_TOKEN = 128258
 OFFSET = 128266
 
+
 # ============================================================
 # GENERATION DEFAULTS
 # ============================================================
@@ -36,17 +86,20 @@ DEFAULT_TOP_P = 0.95
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_MAX_NEW_TOKENS = 500
 
+
 # ============================================================
 # TTS GENERATOR
 # ============================================================
 
-
 class BayanTTS:
+
     def __init__(self):
+
         print("=" * 60)
         print("Initializing Bayan TTS")
         print(f"Model: {MODEL_ID}")
         print(f"Device: {DEVICE}")
+        print(f"HF cache: {HF_CACHE_DIR}")
         print("=" * 60)
 
         if DEVICE != "cuda":
@@ -76,11 +129,33 @@ class BayanTTS:
 
         print("Loading SNAC...")
 
+        snac_path = self._get_cached_model(
+            repo_id=SNAC_MODEL_ID,
+            token=None,
+            name="SNAC"
+        )
+
         self.snac_model = (
-            SNAC.from_pretrained(SNAC_MODEL_ID)
+            SNAC.from_pretrained(snac_path)
             .to(DEVICE)
             .eval()
         )
+
+        print("SNAC loaded successfully.")
+
+        # ----------------------------------------------------
+        # Load Bayan model
+        # ----------------------------------------------------
+
+        print("Preparing Bayan model cache...")
+
+        bayan_path = self._get_cached_model(
+            repo_id=MODEL_ID,
+            token=hf_token,
+            name="Bayan"
+        )
+
+        print(f"Bayan model path: {bayan_path}")
 
         # ----------------------------------------------------
         # Load tokenizer
@@ -89,21 +164,23 @@ class BayanTTS:
         print("Loading tokenizer...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_ID,
-            token=hf_token,
+            bayan_path,
+            local_files_only=True,
         )
+
+        print("Tokenizer loaded successfully.")
 
         # ----------------------------------------------------
         # Load fine-tuned model
         # ----------------------------------------------------
 
-        print("Loading Bayan model...")
+        print("Loading Bayan model into GPU...")
 
         self.model = (
             AutoModelForCausalLM.from_pretrained(
-                MODEL_ID,
+                bayan_path,
                 torch_dtype=torch.bfloat16,
-                token=hf_token,
+                local_files_only=True,
             )
             .to(DEVICE)
             .eval()
@@ -112,11 +189,64 @@ class BayanTTS:
         print("Bayan model loaded successfully.")
         print("=" * 60)
 
+
+    # ========================================================
+    # HUGGING FACE MODEL CACHE
+    # ========================================================
+
+    def _get_cached_model(
+        self,
+        repo_id,
+        token=None,
+        name="model",
+    ):
+        """
+        Download a Hugging Face repository once and reuse the
+        cached snapshot on subsequent worker starts.
+
+        If /runpod-volume exists, the cache survives worker
+        replacement/restarts provided the RunPod network volume
+        remains attached to the endpoint.
+
+        snapshot_download() automatically reuses an existing
+        cached snapshot instead of downloading everything again.
+        """
+
+        print("-" * 60)
+        print(f"Checking {name} cache")
+        print(f"Repository: {repo_id}")
+        print(f"Cache directory: {HF_CACHE_DIR}")
+
+        try:
+
+            snapshot_path = snapshot_download(
+                repo_id=repo_id,
+                token=token,
+                cache_dir=HF_CACHE_DIR,
+            )
+
+            print(f"{name} snapshot ready.")
+            print(f"Local path: {snapshot_path}")
+
+            return snapshot_path
+
+        except Exception as e:
+
+            print("=" * 60)
+            print(f"ERROR while downloading/caching {name}")
+            print(f"Repository: {repo_id}")
+            print(f"Error: {e}")
+            print("=" * 60)
+
+            raise
+
+
     # ========================================================
     # SNAC AUDIO DECODING
     # ========================================================
 
     def decode_audio(self, code_list):
+
         """
         Convert Orpheus interleaved audio tokens into
         SNAC codes and decode to 24 kHz audio.
@@ -202,9 +332,11 @@ class BayanTTS:
         ]
 
         with torch.no_grad():
+
             audio = self.snac_model.decode(codes)
 
         return audio.cpu().numpy().squeeze()
+
 
     # ========================================================
     # SENTENCE GENERATION
@@ -222,7 +354,9 @@ class BayanTTS:
         text = text.strip()
 
         if not text:
-            raise ValueError("Text cannot be empty.")
+            raise ValueError(
+                "Text cannot be empty."
+            )
 
         # ----------------------------------------------------
         # Tokenize text
@@ -283,6 +417,7 @@ class BayanTTS:
         ).nonzero(as_tuple=True)
 
         if len(token_indices[1]) == 0:
+
             raise RuntimeError(
                 "SOS token was not found in model output."
             )
@@ -315,6 +450,7 @@ class BayanTTS:
         ]
 
         if not speech_tokens:
+
             raise RuntimeError(
                 "No speech tokens were generated."
             )
@@ -338,6 +474,7 @@ class BayanTTS:
 
         return audio
 
+
     # ========================================================
     # LONG-FORM GENERATION
     # ========================================================
@@ -351,8 +488,6 @@ class BayanTTS:
         max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
     ):
 
-        # Simple sentence splitting.
-
         import re
 
         clean_text = re.sub(
@@ -362,6 +497,7 @@ class BayanTTS:
         ).strip()
 
         if not clean_text:
+
             raise ValueError(
                 "Text cannot be empty."
             )
@@ -412,6 +548,7 @@ class BayanTTS:
             )
 
         if not combined_audio:
+
             raise RuntimeError(
                 "No audio was generated."
             )
@@ -435,13 +572,29 @@ def get_generator():
     global generator
 
     if generator is None:
+
+        print("=" * 60)
+        print("Creating BayanTTS generator for this worker.")
+        print("This should happen only once per worker.")
+        print("=" * 60)
+
         generator = BayanTTS()
+
+        print("=" * 60)
+        print("BayanTTS generator is now cached in memory.")
+        print("=" * 60)
+
+    else:
+
+        print(
+            "Reusing cached BayanTTS generator."
+        )
 
     return generator
 
 
 # ============================================================
-# TEST
+# LOCAL TEST
 # ============================================================
 
 if __name__ == "__main__":
